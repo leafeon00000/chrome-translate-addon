@@ -44,15 +44,36 @@
   // 左iframe（英語原文）へ注入する単語ホバー辞書ツールチップのスタイル。
   // ページ既存CSSに打ち消されないよう主要プロパティを !important で固定する。
   const WORD_TIP_STYLE =
-    '.tv-word-tip{position:fixed !important;z-index:2147483647 !important;max-width:320px !important;' +
+    '.tv-word-tip{position:fixed !important;z-index:2147483647 !important;max-width:360px !important;' +
     'padding:6px 10px !important;border-radius:6px !important;background:rgba(17,24,39,0.96) !important;' +
-    'color:#f9fafb !important;font-size:13px !important;line-height:1.4 !important;' +
+    'color:#f9fafb !important;font-size:13px !important;line-height:1.45 !important;' +
     "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif !important;" +
     'box-shadow:0 4px 12px rgba(0,0,0,0.3) !important;pointer-events:none !important;' +
     'white-space:normal !important;display:none !important;}' +
     '.tv-word-tip.tv-word-tip-show{display:block !important;}' +
     '.tv-word-tip .tv-word-tip-src{color:#93c5fd !important;font-weight:600 !important;}' +
-    '.tv-word-tip .tv-word-tip-arrow{color:#9ca3af !important;margin:0 6px !important;}'
+    '.tv-word-tip .tv-word-tip-arrow{color:#9ca3af !important;margin:0 6px !important;}' +
+    '.tv-word-tip .tv-word-tip-dict{margin-top:5px !important;padding-top:5px !important;' +
+    'border-top:1px solid rgba(255,255,255,0.15) !important;}' +
+    '.tv-word-tip .tv-word-tip-row{font-size:12px !important;color:#e5e7eb !important;}' +
+    '.tv-word-tip .tv-word-tip-loading{margin-top:5px !important;font-size:11px !important;' +
+    'color:#9ca3af !important;font-style:italic !important;}'
+
+  // 単語ホバー辞書（Prompt API / Gemini Nano）への指示。出力形式を固定するためのシステムプロンプト。
+  // 「[品詞] 意味1／意味2／…」を品詞ごとに1行（最大4行）。前置きや例文は付けさせない。
+  const DICT_SYSTEM_PROMPT =
+    'あなたは英和辞典です。ユーザーが送る英単語1語について、日本語の意味を品詞ごとにまとめて返します。' +
+    '各品詞につき1行、「[品詞] 意味1／意味2／…」の形式で出力します（例: [動] 走る／運営する）。' +
+    '品詞略号は [動][名][形][副][前][接][代][助][間] のいずれかを必ず角括弧で囲んで行頭に置きます。' +
+    '意味はその品詞で代表的なものを最大4個、全角スラッシュ「／」区切り。該当する品詞の行のみ、最大4行。' +
+    '前置き・説明・例文・原語の繰り返し・箇条書き記号やコードブロックは一切付けず、指定の行だけを返してください。'
+
+  // 品詞名（フル/略）→ 1文字略号 の対応（辞書行の行頭品詞を [略号] に正規化するのに使う）
+  const POS_ABBR = {
+    動詞: '動', 名詞: '名', 形容詞: '形', 副詞: '副', 前置詞: '前', 接続詞: '接',
+    代名詞: '代', 助動詞: '助', 間投詞: '間', 感動詞: '間',
+    動: '動', 名: '名', 形: '形', 副: '副', 前: '前', 接: '接', 代: '代', 助: '助', 間: '間',
+  }
 
   /**
    * 現在のDOMをスナップショットし、iframe srcdoc 用のHTML文字列を生成する。
@@ -521,10 +542,41 @@
     return /[A-Za-z]/.test(word) ? word : null
   }
 
+  // 単語ホバー辞書セッション（Prompt API / Gemini Nano）。初回のみ生成して使い回す。
+  let dictSessionPromise = null
+
   /**
-   * 左iframe（英語原文）で単語にマウスオーバーすると、その単語の訳を
-   * カーソル近傍のツールチップに表示する機能を有効化する。
-   * 翻訳には「翻訳開始」で生成済みの translator を流用する。
+   * 単語ホバー辞書用の Prompt API セッションを生成する。
+   * Prompt API（LanguageModel）が無い／利用不可なら null（辞書なし＝機械翻訳のみにフォールバック）。
+   * @returns {Promise<object|null>} セッション、または null
+   */
+  async function prepareDictSession() {
+    if (typeof LanguageModel === 'undefined') return null
+    try {
+      const avail = await LanguageModel.availability()
+      if (avail === 'unavailable') return null
+      return await LanguageModel.create({
+        initialPrompts: [{ role: 'system', content: DICT_SYSTEM_PROMPT }],
+      })
+    } catch (err) {
+      console.error('辞書セッションの初期化に失敗:', err)
+      return null
+    }
+  }
+
+  /**
+   * 辞書セッションを取得する（初回のみ生成し、以降は同じ Promise を返す）。
+   * @returns {Promise<object|null>}
+   */
+  function getDictSession() {
+    if (!dictSessionPromise) dictSessionPromise = prepareDictSession()
+    return dictSessionPromise
+  }
+
+  /**
+   * 左iframe（英語原文）で単語にマウスオーバーすると、訳と辞書をツールチップ表示する機能を有効化する。
+   * まず Translator の機械翻訳を即表示し、Prompt API（Gemini Nano）の辞書（品詞＋意味複数）が
+   * 返ったら追記する2段階表示。Prompt API が使えない環境では機械翻訳のみ表示する。
    *
    * @param {Document} leftDoc 左iframeのドキュメント
    * @param {Translator} translator 流用する翻訳インスタンス
@@ -544,11 +596,20 @@
     tip.className = 'tv-word-tip'
     leftDoc.body.appendChild(tip)
 
-    // 単語→訳 のキャッシュ（同じ単語の再ホバーを即時化し、翻訳呼び出しを節約）
-    const cache = new Map()
-    // 現在カーソル下にある単語。非同期翻訳の解決時に最新語と一致する時だけ表示する
+    // 機械翻訳・辞書を別々にキャッシュ（再ホバーを即時化）
+    const mtCache = new Map()
+    const dictCache = new Map()
+    // Prompt API セッション（準備でき次第セットされる。null の間は機械翻訳のみ表示）
+    let lmSession = null
+    getDictSession().then((s) => {
+      lmSession = s
+    })
+
+    // 現在カーソル下にある単語。非同期解決時に最新語と一致する時だけ反映する
     let currentWord = null
     let debounceTimer = 0
+    let lastX = 0
+    let lastY = 0
 
     /** ツールチップを隠す。 */
     function hideTip() {
@@ -557,24 +618,69 @@
     }
 
     /**
-     * ツールチップを表示してカーソル近傍に配置する（画面端でクランプ）。
+     * 辞書1行の行頭にある品詞を「[略号] 」形式へ正規化する。
+     * LLM出力が「動: 走る」「動詞 走る」「[動]走る」等とブレても [動] 走る に揃える。
+     * 品詞が認識できなければ原文をそのまま返す。
+     * @param {string} line 1行分のテキスト
+     * @returns {string} 整形後の行
+     */
+    function formatDictLine(line) {
+      const t = line.trim()
+      const m = t.match(
+        /^[[(（【]?\s*(動詞|名詞|形容詞|副詞|前置詞|接続詞|代名詞|助動詞|間投詞|感動詞|[動名形副前接代助間])\s*[\])）】]?\s*[:：.、]?\s*(.+)$/
+      )
+      return m ? `[${POS_ABBR[m[1]] || m[1]}] ${m[2].trim()}` : t
+    }
+
+    /**
+     * ツールチップの内容を描画する（機械翻訳の見出し＋辞書 or 読み込み中）。
      * @param {string} word 原語
-     * @param {string} meaning 訳
-     * @param {number} x カーソルX（iframe内クライアント座標）
-     * @param {number} y カーソルY
+     * @param {string} mt 機械翻訳
+     * @param {string|null} dictText 辞書テキスト（未取得は null）
+     * @param {boolean} loading 辞書取得中か
      * @returns {void}
      */
-    function showTip(word, meaning, x, y) {
+    function renderTip(word, mt, dictText, loading) {
       tip.textContent = ''
+      const head = leftDoc.createElement('div')
+      head.className = 'tv-word-tip-head'
       const src = leftDoc.createElement('span')
       src.className = 'tv-word-tip-src'
       src.textContent = word
       const arrow = leftDoc.createElement('span')
       arrow.className = 'tv-word-tip-arrow'
       arrow.textContent = '→'
-      tip.append(src, arrow, leftDoc.createTextNode(meaning))
-      tip.classList.add('tv-word-tip-show')
+      head.append(src, arrow, leftDoc.createTextNode(mt || '—'))
+      tip.appendChild(head)
 
+      if (dictText) {
+        const dict = leftDoc.createElement('div')
+        dict.className = 'tv-word-tip-dict'
+        for (const line of dictText.split('\n')) {
+          const t = line.trim()
+          if (!t) continue
+          const row = leftDoc.createElement('div')
+          row.className = 'tv-word-tip-row'
+          row.textContent = formatDictLine(t)
+          dict.appendChild(row)
+        }
+        if (dict.childNodes.length) tip.appendChild(dict)
+      } else if (loading) {
+        const ld = leftDoc.createElement('div')
+        ld.className = 'tv-word-tip-loading'
+        ld.textContent = '辞書を読み込み中…'
+        tip.appendChild(ld)
+      }
+      tip.classList.add('tv-word-tip-show')
+    }
+
+    /**
+     * ツールチップをカーソル近傍に配置する（画面端でクランプ）。
+     * @param {number} x カーソルX（iframe内クライアント座標）
+     * @param {number} y カーソルY
+     * @returns {void}
+     */
+    function positionTip(x, y) {
       const margin = 12
       const vw = leftDoc.documentElement.clientWidth
       const vh = leftDoc.documentElement.clientHeight
@@ -587,12 +693,24 @@
     }
 
     /**
-     * カーソル位置の単語を解決し、必要なら翻訳してツールチップを更新する。
+     * Prompt API で単語の辞書（品詞＋意味複数）を取得する。
+     * @param {string} word 英単語
+     * @returns {Promise<string>} 辞書テキスト（行区切り）
+     */
+    async function fetchDict(word) {
+      const out = await lmSession.prompt(word)
+      return (out || '').trim()
+    }
+
+    /**
+     * カーソル位置の単語を解決し、機械翻訳を即表示してから辞書を追記する。
      * @param {number} x カーソルX
      * @param {number} y カーソルY
      * @returns {Promise<void>}
      */
     async function handleAt(x, y) {
+      lastX = x
+      lastY = y
       const range = leftDoc.caretRangeFromPoint(x, y)
       if (!range || range.startContainer.nodeType !== 3) {
         hideTip()
@@ -605,22 +723,44 @@
       }
       if (word === currentWord) {
         // 同じ単語上の移動：位置だけ追従させる
-        if (tip.classList.contains('tv-word-tip-show')) showTip(word, tip.lastChild.nodeValue, x, y)
+        if (tip.classList.contains('tv-word-tip-show')) positionTip(x, y)
         return
       }
       currentWord = word
 
-      if (cache.has(word)) {
-        showTip(word, cache.get(word), x, y)
-        return
+      // 1) 機械翻訳を即表示（キャッシュ優先）
+      let mt = mtCache.get(word)
+      if (mt == null) {
+        try {
+          mt = await translator.translate(word)
+        } catch (err) {
+          console.error('単語の翻訳に失敗:', err)
+          mt = ''
+        }
+        mtCache.set(word, mt)
       }
-      try {
-        const meaning = await translator.translate(word)
-        cache.set(word, meaning)
-        // 翻訳待ちの間にカーソルが別語へ移っていたら表示しない
-        if (currentWord === word) showTip(word, meaning, x, y)
-      } catch (err) {
-        console.error('単語の翻訳に失敗:', err)
+      // 機械翻訳待ちの間にカーソルが別語へ移っていたら反映しない
+      if (currentWord !== word) return
+      const cachedDict = dictCache.get(word)
+      const wantDict = lmSession != null && cachedDict == null
+      renderTip(word, mt, cachedDict || null, wantDict)
+      positionTip(lastX, lastY)
+
+      // 2) 辞書（Prompt API）が使えるなら取得して追記
+      if (wantDict) {
+        let dict
+        try {
+          dict = await fetchDict(word)
+        } catch (err) {
+          console.error('辞書の取得に失敗:', err)
+          dict = ''
+        }
+        dictCache.set(word, dict)
+        // 辞書待ちの間にカーソルが別語へ移っていたら反映しない
+        if (currentWord === word) {
+          renderTip(word, mt, dict || null, false)
+          positionTip(lastX, lastY)
+        }
       }
     }
 
@@ -923,6 +1063,12 @@
     if (sharedTranslator && typeof sharedTranslator.destroy === 'function') {
       sharedTranslator.destroy()
       sharedTranslator = null
+    }
+    if (dictSessionPromise) {
+      dictSessionPromise.then((s) => {
+        if (s && typeof s.destroy === 'function') s.destroy()
+      })
+      dictSessionPromise = null
     }
     overlay.remove()
     document.documentElement.style.overflow = prevHtmlOverflow
