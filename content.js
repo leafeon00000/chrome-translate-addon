@@ -325,7 +325,7 @@
           m.addEventListener('downloadprogress', (e) => {
             const pct = Math.round(e.loaded * 100)
             status.textContent = `翻訳モデルをダウンロード中… ${pct}%`
-            progressFill.style.width = `${pct}%`
+            progressFill.style.setProperty('width', `${pct}%`, 'important')
           })
         },
       })
@@ -467,7 +467,7 @@
     }
     const sids = Array.from(groups.keys())
     const cache = new Map()
-    progressFill.style.width = '0%'
+    progressFill.style.setProperty('width', '0%', 'important')
     let done = 0
 
     await runPool(
@@ -490,7 +490,7 @@
           console.error(`${unit}の翻訳に失敗:`, err)
         } finally {
           done++
-          progressFill.style.width = `${Math.round((done / sids.length) * 100)}%`
+          progressFill.style.setProperty('width', `${Math.round((done / sids.length) * 100)}%`, 'important')
           status.textContent = `翻訳中… ${done} / ${sids.length}`
         }
       },
@@ -854,7 +854,7 @@
       // 既に翻訳済み（span化済み）なら、スナップショットから作り直して粒度変更・再翻訳に備える
       if (rightDoc.querySelector('[data-tv-sid]')) {
         status.textContent = '再読み込み中…'
-        progressFill.style.width = '0%'
+        progressFill.style.setProperty('width', '0%', 'important')
         const lp = waitSnapshotLoad(leftIframe)
         const rp = waitSnapshotLoad(rightIframe)
         leftIframe.srcdoc = snapshotHtml

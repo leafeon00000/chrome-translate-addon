@@ -91,7 +91,8 @@
   flex: 0 0 auto !important;
 }
 .tv-progress-fill {
-  width: 0% !important;
+  /* width は JS がインラインで動的に更新するため !important を付けない（付けると更新が打ち消される） */
+  width: 0%;
   height: 100% !important;
   background: #34d399 !important;
   transition: width 0.2s ease !important;
