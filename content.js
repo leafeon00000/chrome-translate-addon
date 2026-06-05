@@ -825,6 +825,8 @@
     curLeftDoc = leftDoc
     curRightDoc = rightDoc
     setupSync(leftDoc, rightDoc)
+    // モデルDL済みなら、アイコンクリックの流れでそのまま自動翻訳を開始する
+    maybeAutoTranslate()
   })
 
   // --- 翻訳開始ボタン（毎回スナップショットから作り直して翻訳。粒度を変えて再翻訳できる）---
@@ -875,6 +877,39 @@
     }
   }
   translateBtn.addEventListener('click', runTranslate)
+
+  /**
+   * アイコンクリック直後の自動翻訳。翻訳モデルが取得済み（available）のときだけ自動で翻訳を走らせる。
+   * 未取得（downloadable/downloading）の初回は、モデルDLにユーザー操作が必要なため自動実行せず、
+   * 「翻訳開始」ボタンを押してもらう旨を表示する（ボタン押下を起点に確実にDLさせる）。
+   * @returns {Promise<void>}
+   */
+  async function maybeAutoTranslate() {
+    if (typeof Translator === 'undefined') {
+      status.textContent = 'このブラウザは内蔵翻訳に未対応です（Chrome 138以降のデスクトップ版が必要）'
+      return
+    }
+    let availability
+    try {
+      availability = await Translator.availability({
+        sourceLanguage: SOURCE_LANG,
+        targetLanguage: TARGET_LANG,
+      })
+    } catch (err) {
+      // 確認に失敗した場合はボタン操作に委ねる
+      console.error(err)
+      return
+    }
+    if (availability === 'available') {
+      // モデルDL不要のため、ユーザー操作なしでそのまま翻訳できる
+      runTranslate()
+    } else if (availability === 'unavailable') {
+      status.textContent = '英→日の翻訳モデルが利用できません（環境を確認してください）'
+    } else {
+      // downloadable / downloading：初回DLにはユーザー操作が要るためボタンを促す
+      status.textContent = '「翻訳開始」を押すと翻訳モデルをダウンロードして翻訳します'
+    }
+  }
 
   // --- Esc キーで閉じる ---
   function onKeydown(e) {
