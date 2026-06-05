@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "対訳ビューア（英→日）",
+  "version": "0.1.0",
+  "description": "開いている英語ページを左=原文／右=日本語訳の2カラムで読み比べる。Chrome内蔵Translator API（オンデバイス翻訳）を使用。",
+  "minimum_chrome_version": "138",
+  "permissions": ["activeTab", "scripting"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "対訳ビューアを開く / 閉じる"
+  }
+}

@@ -1,0 +1,98 @@
+/*
+ * 対訳ビューア（iframe実体方式）のスタイル。
+ * オーバーレイとツールバーのみを対象とする。iframe内部のページCSSには干渉しない。
+ * 主要プロパティはページ既存CSSに打ち消されないよう !important で固定する。
+ */
+
+.tv-overlay {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483647 !important;
+  background: #ffffff !important;
+  display: flex !important;
+  flex-direction: column !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Hiragino Kaku Gothic ProN', Meiryo, sans-serif !important;
+  color: #1a1a1a !important;
+  box-sizing: border-box !important;
+}
+
+/* --- ツールバー --- */
+.tv-toolbar {
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+  padding: 8px 14px !important;
+  background: #1f2937 !important;
+  color: #f9fafb !important;
+  flex: 0 0 auto !important;
+  border-bottom: 1px solid #111827 !important;
+}
+
+.tv-title {
+  font-weight: 600 !important;
+  font-size: 14px !important;
+  white-space: nowrap !important;
+}
+
+.tv-status {
+  font-size: 12px !important;
+  color: #d1d5db !important;
+  flex: 1 1 auto !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+.tv-btn {
+  font-size: 13px !important;
+  padding: 6px 12px !important;
+  border: none !important;
+  border-radius: 6px !important;
+  cursor: pointer !important;
+  background: #374151 !important;
+  color: #f9fafb !important;
+  flex: 0 0 auto !important;
+}
+.tv-btn-primary {
+  background: #2563eb !important;
+}
+.tv-btn-primary:disabled {
+  background: #6b7280 !important;
+  cursor: default !important;
+}
+.tv-btn-close {
+  background: #4b5563 !important;
+}
+
+/* --- 進捗バー --- */
+.tv-progress {
+  width: 140px !important;
+  height: 6px !important;
+  background: #4b5563 !important;
+  border-radius: 3px !important;
+  overflow: hidden !important;
+  flex: 0 0 auto !important;
+}
+.tv-progress-fill {
+  width: 0% !important;
+  height: 100% !important;
+  background: #34d399 !important;
+  transition: width 0.2s ease !important;
+}
+
+/* --- 左右iframe --- */
+.tv-columns {
+  display: flex !important;
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+}
+.tv-iframe {
+  width: 50% !important;
+  height: 100% !important;
+  border: 0 !important;
+  display: block !important;
+}
+.tv-iframe + .tv-iframe {
+  border-left: 1px solid #e5e7eb !important;
+}
