@@ -106,11 +106,34 @@
   }
 
   /**
+   * iframe に snapshot がロードされた本物のドキュメントを待つ。
+   * srcdoc 設定直後は一瞬 about:blank（readyState=complete）が存在するため、readyState では
+   * 判定せず、data-tv-id を含むドキュメントがロードされた load イベントだけを採用する。
+   * 再翻訳時の srcdoc 再設定（再ロード）でも、設定前にこの Promise を張れば新ドキュメントを得られる。
+   *
+   * @param {HTMLIFrameElement} iframe 対象iframe
+   * @returns {Promise<Document>} snapshot がロードされたドキュメント
+   */
+  function waitSnapshotLoad(iframe) {
+    return new Promise((resolve) => {
+      const onload = () => {
+        const doc = iframe.contentDocument
+        if (doc && doc.querySelector('[data-tv-id]')) {
+          iframe.removeEventListener('load', onload)
+          resolve(doc)
+        }
+      }
+      iframe.addEventListener('load', onload)
+    })
+  }
+
+  /**
    * 全画面オーバーレイ（ツールバー＋左右iframe）を構築して追加する。
    *
    * @param {string} snapshotHtml srcdoc に渡すHTML
-   * @returns {{ overlay: HTMLElement, translateBtn: HTMLButtonElement, status: HTMLElement,
-   *            progressFill: HTMLElement, leftIframe: HTMLIFrameElement, rightIframe: HTMLIFrameElement }}
+   * @returns {{ overlay: HTMLElement, granularity: HTMLSelectElement, translateBtn: HTMLButtonElement,
+   *            status: HTMLElement, progressFill: HTMLElement, leftIframe: HTMLIFrameElement,
+   *            rightIframe: HTMLIFrameElement }}
    */
   function buildOverlay(snapshotHtml) {
     const overlay = document.createElement('div')
@@ -123,6 +146,18 @@
     const title = document.createElement('span')
     title.className = 'tv-title'
     title.textContent = '対訳ビューア（英→日）'
+
+    // 翻訳粒度の切替（翻訳開始前に選択。実行中は無効化する）
+    const granularity = document.createElement('select')
+    granularity.className = 'tv-granularity'
+    granularity.title = '翻訳・ハイライトの単位'
+    const optSentence = document.createElement('option')
+    optSentence.value = 'sentence'
+    optSentence.textContent = '文単位'
+    const optBlock = document.createElement('option')
+    optBlock.value = 'block'
+    optBlock.textContent = 'まとまり単位'
+    granularity.append(optSentence, optBlock)
 
     const translateBtn = document.createElement('button')
     translateBtn.className = 'tv-btn tv-btn-primary'
@@ -143,7 +178,7 @@
     closeBtn.textContent = '閉じる ✕'
     closeBtn.addEventListener('click', () => window.__translateAddonTeardown())
 
-    toolbar.append(title, translateBtn, status, progress, closeBtn)
+    toolbar.append(title, granularity, translateBtn, status, progress, closeBtn)
 
     // --- 左右iframe ---
     const columns = document.createElement('div')
@@ -154,25 +189,9 @@
     const rightIframe = document.createElement('iframe')
     rightIframe.className = 'tv-iframe'
 
-    // load Promise を「srcdoc 設定前」に張る。srcdoc を設定した直後は一瞬 about:blank
-    // （readyState=complete）が存在するため、readyState で判定すると空ドキュメントを
-    // 掴んでしまう。確実に「snapshot がロードされた本物のドキュメント」を得るため、
-    // 未接続のうちに srcdoc を設定 → 接続で発火する唯一の load を待つ。
-    // snapshot（data-tv-id を含む本物のドキュメント）がロードされた時だけ解決する。
-    // 空の about:blank の load は無視する。
-    const loadPromise = (iframe) =>
-      new Promise((resolve) => {
-        const onload = () => {
-          const doc = iframe.contentDocument
-          if (doc && doc.querySelector('[data-tv-id]')) {
-            iframe.removeEventListener('load', onload)
-            resolve(doc)
-          }
-        }
-        iframe.addEventListener('load', onload)
-      })
-    const leftLoaded = loadPromise(leftIframe)
-    const rightLoaded = loadPromise(rightIframe)
+    // snapshot ロード完了を待つ Promise を「srcdoc 設定前」に張る（waitSnapshotLoad 参照）
+    const leftLoaded = waitSnapshotLoad(leftIframe)
+    const rightLoaded = waitSnapshotLoad(rightIframe)
 
     // 未接続の状態で srcdoc を設定（この時点では load は発火しない）
     leftIframe.srcdoc = snapshotHtml
@@ -185,6 +204,7 @@
 
     return {
       overlay,
+      granularity,
       translateBtn,
       status,
       progressFill,
@@ -346,19 +366,22 @@
   }
 
   /**
-   * ドキュメントを「文」単位の <span class="tv-sent" data-tv-sid> に変換する。
-   * ブロック（<p> 等）ごとに配下テキストを連結して完全な文を作り、文範囲を各テキストノードへ
-   * 射影して span 化する。1文が <a> 等の装飾をまたぐ場合は、複数の span に分割しつつ同一 sid を
-   * 付与する（左ペインの装飾を保ったまま、ハイライトは1文単位で連動させるため）。
-   * 各文の先頭 span には完全英文を data-tv-src として持たせ、右ペインの翻訳に使う。
+   * ドキュメントを翻訳・ハイライトの単位の <span class="tv-sent" data-tv-sid> に変換する。
+   * ブロック（<p> 等）ごとに配下テキストを連結し、`mode` に応じて区切る：
+   * - 'sentence'（文単位）: 連結テキストを文に分割する
+   * - 'block'（まとまり単位）: ブロック全体を1単位として扱う（文分割しない）
+   * 区切った範囲を各テキストノードへ射影して span 化する。1単位が <a> 等の装飾をまたぐ場合は、
+   * 複数の span に分割しつつ同一 sid を付与する（左ペインの装飾を保ったまま連動させるため）。
+   * 各単位の先頭 span には完全英文を data-tv-src として持たせ、右ペインの翻訳に使う。
    *
    * 左右iframeは同一スナップショットなので、同じ走査順・同じ分割により sid が左右で一致する。
    * 前後の空白は span の外に出し、語間スペースの崩れを防ぐ。
    *
    * @param {Document} doc ラップ対象のドキュメント
+   * @param {'sentence'|'block'} mode 翻訳・ハイライトの単位
    * @returns {void}
    */
-  function wrapSentences(doc) {
+  function wrapSentences(doc, mode) {
     let sid = 0
     for (const [, nodes] of groupTextNodesByBlock(doc)) {
       // ブロック内テキストを連結し、各ノードの開始位置を記録する
@@ -370,10 +393,12 @@
       }
       if (!/[A-Za-z]/.test(full)) continue // 英字がなければ対象外
 
-      // full を文に分割し、各文の [start, end)・sid・完全英文を決める
+      // mode に応じて区切る（文単位は文分割、まとまり単位はブロック全体を1単位）
+      const chunks = mode === 'block' ? [full] : splitIntoSentences(full)
+      // 各区切りの [start, end)・sid・完全英文を決める
       const sentences = []
       let pos = 0
-      for (const chunk of splitIntoSentences(full)) {
+      for (const chunk of chunks) {
         const start = pos
         const end = pos + chunk.length
         pos = end
@@ -428,9 +453,11 @@
    * @param {Translator} translator 翻訳インスタンス
    * @param {HTMLElement} status 状態表示用の要素
    * @param {HTMLElement} progressFill 進捗バーの伸縮要素
+   * @param {'sentence'|'block'} mode 翻訳単位（進捗表示の文言に使う）
    * @returns {Promise<void>}
    */
-  async function translateSentences(rightDoc, translator, status, progressFill) {
+  async function translateSentences(rightDoc, translator, status, progressFill, mode) {
+    const unit = mode === 'block' ? '段落' : '文'
     // 同一 sid の span（装飾またぎで複数に分かれることがある）を文書順にグループ化する
     const groups = new Map()
     for (const span of rightDoc.querySelectorAll('[data-tv-sid]')) {
@@ -459,8 +486,8 @@
           spans[0].textContent = translated
           for (let k = 1; k < spans.length; k++) spans[k].textContent = ''
         } catch (err) {
-          // 1文の失敗は全体を止めない（原文のまま残す）
-          console.error('文の翻訳に失敗:', err)
+          // 1単位の失敗は全体を止めない（原文のまま残す）
+          console.error(`${unit}の翻訳に失敗:`, err)
         } finally {
           done++
           progressFill.style.width = `${Math.round((done / sids.length) * 100)}%`
@@ -470,7 +497,7 @@
       CONCURRENCY
     )
 
-    status.textContent = `完了: ${sids.length} 文を翻訳しました`
+    status.textContent = `完了: ${sids.length} ${unit}を翻訳しました`
   }
 
   /**
@@ -622,42 +649,27 @@
   const prevHtmlOverflow = document.documentElement.style.overflow
   document.documentElement.style.overflow = 'hidden'
 
-  const { overlay, translateBtn, status, progressFill, leftIframe, rightIframe, leftLoaded, rightLoaded } =
+  const { overlay, granularity, translateBtn, status, progressFill, leftIframe, rightIframe, leftLoaded, rightLoaded } =
     buildOverlay(snapshotHtml)
 
   // 単語ホバー辞書で流用し、teardown で破棄するための translator 参照
   let sharedTranslator = null
 
-  // --- 翻訳開始ボタン（ユーザー操作起点でモデルDL／翻訳を実行）---
-  translateBtn.addEventListener('click', async () => {
-    translateBtn.disabled = true
-    const [rightDoc, leftDoc] = await Promise.all([rightLoaded, leftLoaded])
-    if (!rightDoc || !leftDoc) {
-      status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
-      return
-    }
-    const translator = await prepareTranslator(status, progressFill)
-    if (!translator) return
-    sharedTranslator = translator
-    // 左右を文単位の <span data-tv-sid> にラップする。
-    // 同一スナップショットを同じアルゴリズムで分割するため sid が左右で一致し、文単位で対応付く。
-    wrapSentences(leftDoc)
-    wrapSentences(rightDoc)
-    // 右ペインの各文を翻訳し、左ペインに単語ホバー辞書を有効化する
-    await translateSentences(rightDoc, translator, status, progressFill)
-    enableWordHover(leftDoc, translator)
-  })
+  // 現在表示中のドキュメント（再翻訳の再ロードで差し替わる）
+  let curLeftDoc = null
+  let curRightDoc = null
 
-  // --- 両iframeのロード後にハイライト連動・スクロール同期をセットアップ ---
-  // ハイライト中の対応付けキー（{ attr, val }）。翻訳後は文 data-tv-sid、翻訳前は要素 data-tv-id。
-  let highlighted = null
-  let isSyncing = false
-
-  Promise.all([leftLoaded, rightLoaded]).then(([leftDoc, rightDoc]) => {
-    if (!leftDoc || !rightDoc) {
-      status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
-      return
-    }
+  // --- ハイライト連動・スクロール同期のセットアップ（再ロードのたびに新docへ張り直す）---
+  /**
+   * 左右ドキュメントにハイライト連動・スクロール同期を張る。
+   * ハイライト中の対応付けキー（{ attr, val }）は翻訳後は文 data-tv-sid、翻訳前は要素 data-tv-id。
+   * @param {Document} leftDoc 左iframeのドキュメント
+   * @param {Document} rightDoc 右iframeのドキュメント
+   * @returns {void}
+   */
+  function setupSync(leftDoc, rightDoc) {
+    let highlighted = null
+    let isSyncing = false
     const docs = [leftDoc, rightDoc]
 
     /**
@@ -802,7 +814,67 @@
     // scroll はバブルしないが、キャプチャフェーズなら内側コンテナのスクロールも捕捉できる
     leftDoc.addEventListener('scroll', (e) => syncScroll(e, leftDoc, rightDoc), true)
     rightDoc.addEventListener('scroll', (e) => syncScroll(e, rightDoc, leftDoc), true)
+  }
+
+  // 初回ロード後：同期セットアップ＋翻訳前の要素ハイライトを有効化する
+  Promise.all([leftLoaded, rightLoaded]).then(([leftDoc, rightDoc]) => {
+    if (!leftDoc || !rightDoc) {
+      status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
+      return
+    }
+    curLeftDoc = leftDoc
+    curRightDoc = rightDoc
+    setupSync(leftDoc, rightDoc)
   })
+
+  // --- 翻訳開始ボタン（毎回スナップショットから作り直して翻訳。粒度を変えて再翻訳できる）---
+  /**
+   * 翻訳を実行する。既に翻訳済みの場合はスナップショットから両iframeを作り直してから翻訳するため、
+   * 翻訳単位（文 / まとまり）を変えて何度でも再翻訳できる。translator は初回のみ生成して再利用する。
+   * @returns {Promise<void>}
+   */
+  async function runTranslate() {
+    const mode = granularity.value
+    translateBtn.disabled = true
+    granularity.disabled = true
+    try {
+      // translator は初回のみ生成（モデルDLにはユーザー操作が要る）。以降は再利用する。
+      if (!sharedTranslator) {
+        sharedTranslator = await prepareTranslator(status, progressFill)
+        if (!sharedTranslator) return
+      }
+      let leftDoc = curLeftDoc
+      let rightDoc = curRightDoc
+      if (!leftDoc || !rightDoc) {
+        status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
+        return
+      }
+      // 既に翻訳済み（span化済み）なら、スナップショットから作り直して粒度変更・再翻訳に備える
+      if (rightDoc.querySelector('[data-tv-sid]')) {
+        status.textContent = '再読み込み中…'
+        progressFill.style.width = '0%'
+        const lp = waitSnapshotLoad(leftIframe)
+        const rp = waitSnapshotLoad(rightIframe)
+        leftIframe.srcdoc = snapshotHtml
+        rightIframe.srcdoc = snapshotHtml
+        ;[leftDoc, rightDoc] = await Promise.all([lp, rp])
+        curLeftDoc = leftDoc
+        curRightDoc = rightDoc
+        setupSync(leftDoc, rightDoc)
+      }
+      // 左右を選択粒度の <span data-tv-sid> にラップ（同一スナップショット＋同一分割で sid 一致）
+      wrapSentences(leftDoc, mode)
+      wrapSentences(rightDoc, mode)
+      // 右ペインを翻訳し、左ペインに単語ホバー辞書を有効化する
+      await translateSentences(rightDoc, sharedTranslator, status, progressFill, mode)
+      enableWordHover(leftDoc, sharedTranslator)
+    } finally {
+      // 粒度を変えて再翻訳できるよう操作を再有効化する
+      translateBtn.disabled = false
+      granularity.disabled = false
+    }
+  }
+  translateBtn.addEventListener('click', runTranslate)
 
   // --- Esc キーで閉じる ---
   function onKeydown(e) {

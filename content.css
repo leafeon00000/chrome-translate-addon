@@ -65,6 +65,22 @@
   background: #4b5563 !important;
 }
 
+/* --- 翻訳粒度セレクト --- */
+.tv-granularity {
+  font-size: 13px !important;
+  padding: 5px 8px !important;
+  border: 1px solid #4b5563 !important;
+  border-radius: 6px !important;
+  background: #374151 !important;
+  color: #f9fafb !important;
+  cursor: pointer !important;
+  flex: 0 0 auto !important;
+}
+.tv-granularity:disabled {
+  opacity: 0.6 !important;
+  cursor: default !important;
+}
+
 /* --- 進捗バー --- */
 .tv-progress {
   width: 140px !important;
