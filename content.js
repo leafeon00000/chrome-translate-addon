@@ -29,11 +29,30 @@
   const CONCURRENCY = 4
   // テキストノードを翻訳対象から除外する親タグ
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'CODE', 'PRE'])
+  // 文を集約する際に「またいでよい」インライン要素。これら以外をブロック境界とみなす。
+  // リンクや装飾（<a>/<b>/<em>…）の内外にまたがる1文を、ブロック単位で連結して扱うために使う。
+  const INLINE_TAGS = new Set([
+    'A', 'ABBR', 'B', 'BDI', 'BDO', 'CITE', 'DATA', 'DFN', 'EM', 'I', 'KBD', 'MARK',
+    'Q', 'RP', 'RT', 'RUBY', 'S', 'SAMP', 'SMALL', 'SPAN', 'STRONG', 'SUB', 'SUP',
+    'TIME', 'U', 'VAR', 'WBR', 'FONT', 'INS', 'DEL', 'BIG', 'TT', 'NOBR', 'LABEL',
+  ])
   // srcdoc 内に注入するハイライト用スタイル
   // 眩しさを抑えるため、薄い半透明の背景＋左端のアクセントバーのみ（明るい塗り・太枠は使わない）
   const HL_STYLE =
     '.tv-hl{background-color:rgba(255,213,79,0.18) !important;' +
     'box-shadow:inset 3px 0 0 rgba(245,166,35,0.7) !important;border-radius:2px !important;}'
+  // 左iframe（英語原文）へ注入する単語ホバー辞書ツールチップのスタイル。
+  // ページ既存CSSに打ち消されないよう主要プロパティを !important で固定する。
+  const WORD_TIP_STYLE =
+    '.tv-word-tip{position:fixed !important;z-index:2147483647 !important;max-width:320px !important;' +
+    'padding:6px 10px !important;border-radius:6px !important;background:rgba(17,24,39,0.96) !important;' +
+    'color:#f9fafb !important;font-size:13px !important;line-height:1.4 !important;' +
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif !important;" +
+    'box-shadow:0 4px 12px rgba(0,0,0,0.3) !important;pointer-events:none !important;' +
+    'white-space:normal !important;display:none !important;}' +
+    '.tv-word-tip.tv-word-tip-show{display:block !important;}' +
+    '.tv-word-tip .tv-word-tip-src{color:#93c5fd !important;font-weight:600 !important;}' +
+    '.tv-word-tip .tv-word-tip-arrow{color:#9ca3af !important;margin:0 6px !important;}'
 
   /**
    * 現在のDOMをスナップショットし、iframe srcdoc 用のHTML文字列を生成する。
@@ -197,41 +216,66 @@
   }
 
   /**
-   * ドキュメント内の翻訳対象テキストノードを収集する。
-   * script/style など除外タグ配下・英字を含まないノードはスキップする。
-   *
-   * @param {Document} doc 走査対象のドキュメント
-   * @returns {Text[]} 翻訳対象テキストノードの配列
+   * テキストノードが翻訳対象外か（script/style など除外タグの直下か）を判定する。
+   * @param {Text} node 判定対象
+   * @returns {boolean} 除外すべきなら true
    */
-  function collectTextNodes(doc) {
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const parent = node.parentElement
-        if (!parent || SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT
-        // 英字を含むテキストのみ翻訳対象にする（記号・数字だけの節約）
-        if (!/[A-Za-z]/.test(node.nodeValue)) return NodeFilter.FILTER_REJECT
-        return NodeFilter.FILTER_ACCEPT
-      },
-    })
-    const nodes = []
-    let n
-    while ((n = walker.nextNode())) nodes.push(n)
-    return nodes
+  function isSkippedText(node) {
+    const parent = node.parentElement
+    return !parent || SKIP_TAGS.has(parent.tagName)
   }
 
   /**
-   * 右iframe内のテキストノードを Translator API で翻訳し、その場で上書きする。
-   * 周囲のHTML/CSS/画像はそのまま残るため、レイアウト・画像を保ったまま訳文に置き換わる。
+   * テキストノードを集約する「ブロック」要素を返す。
+   * 親を辿り、最初の非インライン要素（ブロック境界）を採用する。
+   * これにより <a> 等の装飾をまたぐ文を1ブロックとして連結できる。
+   * @param {Text} node 対象テキストノード
+   * @returns {Element|null} 集約先のブロック要素
+   */
+  function nearestBlock(node) {
+    let el = node.parentElement
+    while (el && INLINE_TAGS.has(el.tagName) && el.parentElement) el = el.parentElement
+    return el
+  }
+
+  /**
+   * doc.body 内の全テキストノード（SKIP 配下を除く・空白/英字なしも含む）を
+   * 文書順に走査し、最近接ブロック要素ごとにグループ化する。
+   * 同一ブロックのテキストを連結することで、装飾またぎの完全な文を復元できる。
    *
-   * @param {Document} rightDoc 右iframeのドキュメント
+   * @param {Document} doc 走査対象のドキュメント
+   * @returns {Map<Element, Text[]>} ブロック要素 → テキストノード配列（各グループ内も文書順）
+   */
+  function groupTextNodesByBlock(doc) {
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return isSkippedText(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+      },
+    })
+    const groups = new Map()
+    let n
+    while ((n = walker.nextNode())) {
+      const block = nearestBlock(n)
+      if (!block) continue
+      if (!groups.has(block)) groups.set(block, [])
+      groups.get(block).push(n)
+    }
+    return groups
+  }
+
+  /**
+   * 翻訳エンジン（Translator）の利用可否を確認し、インスタンスを生成して返す。
+   * モデル未取得時はダウンロード進捗を status / progressFill に反映する。
+   * 生成した translator は破棄せず返す（文翻訳と単語ホバー辞書で流用し、teardown で破棄）。
+   *
    * @param {HTMLElement} status 状態表示用の要素
    * @param {HTMLElement} progressFill 進捗バーの伸縮要素
-   * @returns {Promise<void>}
+   * @returns {Promise<Translator|null>} 生成した translator（利用不可・失敗時は null）
    */
-  async function translateDocument(rightDoc, status, progressFill) {
+  async function prepareTranslator(status, progressFill) {
     if (typeof Translator === 'undefined') {
       status.textContent = 'このブラウザは内蔵翻訳に未対応です（Chrome 138以降のデスクトップ版が必要）'
-      return
+      return null
     }
 
     status.textContent = '翻訳エンジンを確認中…'
@@ -244,18 +288,17 @@
     } catch (err) {
       status.textContent = '翻訳エンジンの確認に失敗しました'
       console.error(err)
-      return
+      return null
     }
     if (availability === 'unavailable') {
       status.textContent = '英→日の翻訳モデルが利用できません（環境を確認してください）'
-      return
+      return null
     }
 
-    let translator
     try {
       status.textContent =
         availability === 'available' ? '翻訳エンジンを準備中…' : '翻訳モデルをダウンロード中…'
-      translator = await Translator.create({
+      return await Translator.create({
         sourceLanguage: SOURCE_LANG,
         targetLanguage: TARGET_LANG,
         monitor(m) {
@@ -269,38 +312,299 @@
     } catch (err) {
       status.textContent = '翻訳エンジンの初期化に失敗しました'
       console.error(err)
-      return
+      return null
     }
+  }
 
-    const nodes = collectTextNodes(rightDoc)
+  /**
+   * 文字列を「文」単位のチャンク配列に分割する。
+   * 終止記号（. ! ?）＋直後の閉じ括弧・引用符・空白までを1文として切り出す。
+   * 連結すると元の文字列に戻る（空白も保持）。略語等による誤分割はベストエフォート。
+   *
+   * @param {string} text 分割対象の文字列
+   * @returns {string[]} 文チャンクの配列
+   */
+  function splitIntoSentences(text) {
+    const result = []
+    let buf = ''
+    let i = 0
+    while (i < text.length) {
+      const ch = text[i]
+      buf += ch
+      i++
+      if (ch === '.' || ch === '!' || ch === '?') {
+        // 連続する終止記号・閉じ括弧・引用符を取り込む
+        while (i < text.length && /[.!?)'"’”]/.test(text[i])) buf += text[i++]
+        // 直後の空白まで含めて文を区切る
+        while (i < text.length && /\s/.test(text[i])) buf += text[i++]
+        result.push(buf)
+        buf = ''
+      }
+    }
+    if (buf) result.push(buf)
+    return result.length ? result : [text]
+  }
+
+  /**
+   * ドキュメントを「文」単位の <span class="tv-sent" data-tv-sid> に変換する。
+   * ブロック（<p> 等）ごとに配下テキストを連結して完全な文を作り、文範囲を各テキストノードへ
+   * 射影して span 化する。1文が <a> 等の装飾をまたぐ場合は、複数の span に分割しつつ同一 sid を
+   * 付与する（左ペインの装飾を保ったまま、ハイライトは1文単位で連動させるため）。
+   * 各文の先頭 span には完全英文を data-tv-src として持たせ、右ペインの翻訳に使う。
+   *
+   * 左右iframeは同一スナップショットなので、同じ走査順・同じ分割により sid が左右で一致する。
+   * 前後の空白は span の外に出し、語間スペースの崩れを防ぐ。
+   *
+   * @param {Document} doc ラップ対象のドキュメント
+   * @returns {void}
+   */
+  function wrapSentences(doc) {
+    let sid = 0
+    for (const [, nodes] of groupTextNodesByBlock(doc)) {
+      // ブロック内テキストを連結し、各ノードの開始位置を記録する
+      let full = ''
+      const map = []
+      for (const node of nodes) {
+        map.push({ node, start: full.length })
+        full += node.nodeValue
+      }
+      if (!/[A-Za-z]/.test(full)) continue // 英字がなければ対象外
+
+      // full を文に分割し、各文の [start, end)・sid・完全英文を決める
+      const sentences = []
+      let pos = 0
+      for (const chunk of splitIntoSentences(full)) {
+        const start = pos
+        const end = pos + chunk.length
+        pos = end
+        const hasAlpha = /[A-Za-z]/.test(chunk)
+        sentences.push({ start, end, sid: hasAlpha ? sid++ : null, text: chunk.trim(), attached: false })
+      }
+
+      // 各ノードを、重なる文範囲ごとに span／テキストへ分割して置換する
+      for (const { node, start } of map) {
+        if (!node.parentNode) continue
+        const nodeText = node.nodeValue
+        const nodeEnd = start + nodeText.length
+        const frag = doc.createDocumentFragment()
+        for (const sent of sentences) {
+          // 文範囲とノード範囲の交差（グローバル座標）を取り、ノードローカルへ変換
+          const from = Math.max(sent.start, start)
+          const to = Math.min(sent.end, nodeEnd)
+          if (from >= to) continue
+          const piece = nodeText.slice(from - start, to - start)
+          if (sent.sid != null && /[A-Za-z]/.test(piece)) {
+            // 前後空白は span の外に出してハイライトのにじみを防ぐ
+            const lead = piece.match(/^\s*/)[0]
+            const trail = piece.match(/\s*$/)[0]
+            const core = piece.slice(lead.length, piece.length - trail.length)
+            if (lead) frag.appendChild(doc.createTextNode(lead))
+            const span = doc.createElement('span')
+            span.className = 'tv-sent'
+            span.setAttribute('data-tv-sid', String(sent.sid))
+            // その文の先頭 span にだけ完全英文を持たせる（右ペイン翻訳用）
+            if (!sent.attached) {
+              span.setAttribute('data-tv-src', sent.text)
+              sent.attached = true
+            }
+            span.textContent = core
+            frag.appendChild(span)
+            if (trail) frag.appendChild(doc.createTextNode(trail))
+          } else {
+            frag.appendChild(doc.createTextNode(piece))
+          }
+        }
+        node.parentNode.replaceChild(frag, node)
+      }
+    }
+  }
+
+  /**
+   * 右iframe内の文 <span data-tv-sid> を Translator API で順に翻訳し、その場で上書きする。
+   * 周囲のHTML/CSS/画像はそのまま残るため、レイアウト・画像を保ったまま訳文に置き換わる。
+   * 同一英文は結果をキャッシュして翻訳呼び出しを節約する。
+   *
+   * @param {Document} rightDoc 右iframeのドキュメント
+   * @param {Translator} translator 翻訳インスタンス
+   * @param {HTMLElement} status 状態表示用の要素
+   * @param {HTMLElement} progressFill 進捗バーの伸縮要素
+   * @returns {Promise<void>}
+   */
+  async function translateSentences(rightDoc, translator, status, progressFill) {
+    // 同一 sid の span（装飾またぎで複数に分かれることがある）を文書順にグループ化する
+    const groups = new Map()
+    for (const span of rightDoc.querySelectorAll('[data-tv-sid]')) {
+      const sid = span.getAttribute('data-tv-sid')
+      if (!groups.has(sid)) groups.set(sid, [])
+      groups.get(sid).push(span)
+    }
+    const sids = Array.from(groups.keys())
+    const cache = new Map()
     progressFill.style.width = '0%'
     let done = 0
 
     await runPool(
-      nodes,
-      async (node) => {
-        const raw = node.nodeValue
-        const trimmed = raw.trim()
+      sids,
+      async (sid) => {
+        const spans = groups.get(sid)
+        // 完全英文は先頭 span の data-tv-src に持たせてある（断片連結だと語間スペースが欠ける）
+        const src = spans[0].getAttribute('data-tv-src') || spans.map((s) => s.textContent).join('')
         try {
-          const translated = await translator.translate(trimmed)
-          // 前後の空白を保ってノードを置換する（語間スペースの崩れを防ぐ）
-          const lead = raw.match(/^\s*/)[0]
-          const trail = raw.match(/\s*$/)[0]
-          node.nodeValue = lead + translated + trail
+          let translated = cache.get(src)
+          if (translated == null) {
+            translated = await translator.translate(src)
+            cache.set(src, translated)
+          }
+          // 訳は先頭 span にまとめて入れ、残りの同 sid span は空にする（右はプレーン訳）
+          spans[0].textContent = translated
+          for (let k = 1; k < spans.length; k++) spans[k].textContent = ''
         } catch (err) {
-          // 1ノードの失敗は全体を止めない（原文のまま残す）
-          console.error('テキスト翻訳に失敗:', err)
+          // 1文の失敗は全体を止めない（原文のまま残す）
+          console.error('文の翻訳に失敗:', err)
         } finally {
           done++
-          progressFill.style.width = `${Math.round((done / nodes.length) * 100)}%`
-          status.textContent = `翻訳中… ${done} / ${nodes.length}`
+          progressFill.style.width = `${Math.round((done / sids.length) * 100)}%`
+          status.textContent = `翻訳中… ${done} / ${sids.length}`
         }
       },
       CONCURRENCY
     )
 
-    status.textContent = `完了: ${nodes.length} 箇所を翻訳しました`
-    if (typeof translator.destroy === 'function') translator.destroy()
+    status.textContent = `完了: ${sids.length} 文を翻訳しました`
+  }
+
+  /**
+   * テキストノード内の指定オフセット位置にある「英単語」を切り出す。
+   * オフセットから左右へ英字・アポストロフィ・ハイフンの連なりを展開する。
+   *
+   * @param {string} text テキストノードの文字列
+   * @param {number} offset カーソル直下の文字オフセット
+   * @returns {string|null} 切り出した単語（英字を含まなければ null）
+   */
+  function extractWordAt(text, offset) {
+    if (!text) return null
+    const isWordChar = (ch) => /[A-Za-z'’-]/.test(ch)
+    // offset がちょうど語末（直後が非単語）になることがあるため、必要なら1つ戻す
+    let start = Math.min(offset, text.length)
+    if (start > 0 && !isWordChar(text[start] || '') && isWordChar(text[start - 1])) start--
+    let end = start
+    while (start > 0 && isWordChar(text[start - 1])) start--
+    while (end < text.length && isWordChar(text[end])) end++
+    const word = text.slice(start, end).replace(/^[''-]+|[''-]+$/g, '')
+    return /[A-Za-z]/.test(word) ? word : null
+  }
+
+  /**
+   * 左iframe（英語原文）で単語にマウスオーバーすると、その単語の訳を
+   * カーソル近傍のツールチップに表示する機能を有効化する。
+   * 翻訳には「翻訳開始」で生成済みの translator を流用する。
+   *
+   * @param {Document} leftDoc 左iframeのドキュメント
+   * @param {Translator} translator 流用する翻訳インスタンス
+   * @returns {void}
+   */
+  function enableWordHover(leftDoc, translator) {
+    // 二重有効化を防ぐ（同一 leftDoc に複数回張らない）
+    if (leftDoc.__tvWordHover) return
+    leftDoc.__tvWordHover = true
+
+    // ツールチップ用スタイルと要素を left iframe 内に注入する
+    const style = leftDoc.createElement('style')
+    style.textContent = WORD_TIP_STYLE
+    ;(leftDoc.head || leftDoc.documentElement).appendChild(style)
+
+    const tip = leftDoc.createElement('div')
+    tip.className = 'tv-word-tip'
+    leftDoc.body.appendChild(tip)
+
+    // 単語→訳 のキャッシュ（同じ単語の再ホバーを即時化し、翻訳呼び出しを節約）
+    const cache = new Map()
+    // 現在カーソル下にある単語。非同期翻訳の解決時に最新語と一致する時だけ表示する
+    let currentWord = null
+    let debounceTimer = 0
+
+    /** ツールチップを隠す。 */
+    function hideTip() {
+      currentWord = null
+      tip.classList.remove('tv-word-tip-show')
+    }
+
+    /**
+     * ツールチップを表示してカーソル近傍に配置する（画面端でクランプ）。
+     * @param {string} word 原語
+     * @param {string} meaning 訳
+     * @param {number} x カーソルX（iframe内クライアント座標）
+     * @param {number} y カーソルY
+     * @returns {void}
+     */
+    function showTip(word, meaning, x, y) {
+      tip.textContent = ''
+      const src = leftDoc.createElement('span')
+      src.className = 'tv-word-tip-src'
+      src.textContent = word
+      const arrow = leftDoc.createElement('span')
+      arrow.className = 'tv-word-tip-arrow'
+      arrow.textContent = '→'
+      tip.append(src, arrow, leftDoc.createTextNode(meaning))
+      tip.classList.add('tv-word-tip-show')
+
+      const margin = 12
+      const vw = leftDoc.documentElement.clientWidth
+      const vh = leftDoc.documentElement.clientHeight
+      let left = x + 14
+      let top = y + 16
+      if (left + tip.offsetWidth + margin > vw) left = Math.max(margin, x - tip.offsetWidth - 14)
+      if (top + tip.offsetHeight + margin > vh) top = Math.max(margin, y - tip.offsetHeight - 16)
+      tip.style.left = `${left}px`
+      tip.style.top = `${top}px`
+    }
+
+    /**
+     * カーソル位置の単語を解決し、必要なら翻訳してツールチップを更新する。
+     * @param {number} x カーソルX
+     * @param {number} y カーソルY
+     * @returns {Promise<void>}
+     */
+    async function handleAt(x, y) {
+      const range = leftDoc.caretRangeFromPoint(x, y)
+      if (!range || range.startContainer.nodeType !== 3) {
+        hideTip()
+        return
+      }
+      const word = extractWordAt(range.startContainer.nodeValue, range.startOffset)
+      if (!word) {
+        hideTip()
+        return
+      }
+      if (word === currentWord) {
+        // 同じ単語上の移動：位置だけ追従させる
+        if (tip.classList.contains('tv-word-tip-show')) showTip(word, tip.lastChild.nodeValue, x, y)
+        return
+      }
+      currentWord = word
+
+      if (cache.has(word)) {
+        showTip(word, cache.get(word), x, y)
+        return
+      }
+      try {
+        const meaning = await translator.translate(word)
+        cache.set(word, meaning)
+        // 翻訳待ちの間にカーソルが別語へ移っていたら表示しない
+        if (currentWord === word) showTip(word, meaning, x, y)
+      } catch (err) {
+        console.error('単語の翻訳に失敗:', err)
+      }
+    }
+
+    leftDoc.addEventListener('mousemove', (e) => {
+      const x = e.clientX
+      const y = e.clientY
+      clearTimeout(debounceTimer)
+      debounceTimer = setTimeout(() => handleAt(x, y), 120)
+    })
+    leftDoc.addEventListener('mouseleave', hideTip)
+    leftDoc.addEventListener('scroll', hideTip, true)
   }
 
   // ---- メイン -------------------------------------------------------------
@@ -321,19 +625,32 @@
   const { overlay, translateBtn, status, progressFill, leftIframe, rightIframe, leftLoaded, rightLoaded } =
     buildOverlay(snapshotHtml)
 
+  // 単語ホバー辞書で流用し、teardown で破棄するための translator 参照
+  let sharedTranslator = null
+
   // --- 翻訳開始ボタン（ユーザー操作起点でモデルDL／翻訳を実行）---
   translateBtn.addEventListener('click', async () => {
     translateBtn.disabled = true
-    const rightDoc = await rightLoaded
-    if (!rightDoc) {
+    const [rightDoc, leftDoc] = await Promise.all([rightLoaded, leftLoaded])
+    if (!rightDoc || !leftDoc) {
       status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
       return
     }
-    await translateDocument(rightDoc, status, progressFill)
+    const translator = await prepareTranslator(status, progressFill)
+    if (!translator) return
+    sharedTranslator = translator
+    // 左右を文単位の <span data-tv-sid> にラップする。
+    // 同一スナップショットを同じアルゴリズムで分割するため sid が左右で一致し、文単位で対応付く。
+    wrapSentences(leftDoc)
+    wrapSentences(rightDoc)
+    // 右ペインの各文を翻訳し、左ペインに単語ホバー辞書を有効化する
+    await translateSentences(rightDoc, translator, status, progressFill)
+    enableWordHover(leftDoc, translator)
   })
 
   // --- 両iframeのロード後にハイライト連動・スクロール同期をセットアップ ---
-  let highlightedId = null
+  // ハイライト中の対応付けキー（{ attr, val }）。翻訳後は文 data-tv-sid、翻訳前は要素 data-tv-id。
+  let highlighted = null
   let isSyncing = false
 
   Promise.all([leftLoaded, rightLoaded]).then(([leftDoc, rightDoc]) => {
@@ -344,17 +661,33 @@
     const docs = [leftDoc, rightDoc]
 
     /**
-     * 指定IDの要素を左右両iframeでハイライト付け外しする。
-     * @param {string|null} id data-tv-id
-     * @param {boolean} on 付与するか
+     * 現在ハイライト中の要素（左右両iframe）を消灯する。
      * @returns {void}
      */
-    function setHighlight(id, on) {
-      if (id == null) return
+    function clearHighlight() {
+      if (!highlighted) return
       for (const doc of docs) {
-        const el = doc.querySelector(`[data-tv-id="${id}"]`)
-        if (el) el.classList.toggle('tv-hl', on)
+        for (const el of doc.querySelectorAll(`[${highlighted.attr}="${highlighted.val}"]`)) {
+          el.classList.remove('tv-hl')
+        }
       }
+      highlighted = null
+    }
+
+    /**
+     * 指定属性・値に対応する要素を左右両iframeで点灯する。
+     * 1文が装飾またぎで複数 span に分かれる場合があるため、全断片を同時に点灯する。
+     * @param {string} attr 対応付けに使う属性（data-tv-sid / data-tv-id）
+     * @param {string} val 属性値
+     * @returns {void}
+     */
+    function applyHighlight(attr, val) {
+      for (const doc of docs) {
+        for (const el of doc.querySelectorAll(`[${attr}="${val}"]`)) {
+          el.classList.add('tv-hl')
+        }
+      }
+      highlighted = { attr, val }
     }
 
     /**
@@ -370,7 +703,9 @@
     }
 
     /**
-     * カーソル位置の要素から、ハイライトすべき「テキストを持つ最も近い要素」を探す。
+     * カーソル位置から、ハイライトすべき対象を探す。
+     * 翻訳後は文 <span class="tv-sent" data-tv-sid> を最小単位として最優先する。
+     * 文spanの外（翻訳前や見出し外）では、テキストを持つ最も近い要素（data-tv-id）を対象にする。
      * 大きな div/section/body などラッパーは対象外にして「全体が光る」のを防ぐ。
      * @param {Element} start e.target
      * @returns {Element|null} ハイライト対象、なければ null
@@ -378,6 +713,7 @@
     function findTextEl(start) {
       let cur = start
       while (cur && cur.getAttribute) {
+        if (cur.classList && cur.classList.contains('tv-sent')) return cur
         if (cur.hasAttribute('data-tv-id') && hasDirectText(cur)) return cur
         cur = cur.parentElement
       }
@@ -390,21 +726,19 @@
         const el = findTextEl(e.target)
         // テキストを持つ要素の上でなければ（余白・ラッパー上）ハイライトを消す
         if (!el) {
-          if (highlightedId !== null) {
-            setHighlight(highlightedId, false)
-            highlightedId = null
-          }
+          clearHighlight()
           return
         }
-        const id = el.getAttribute('data-tv-id')
-        if (id === highlightedId) return
-        setHighlight(highlightedId, false)
-        highlightedId = id
-        setHighlight(highlightedId, true)
+        // 文spanなら sid、それ以外は要素IDで左右を対応付ける
+        const sid = el.getAttribute('data-tv-sid')
+        const attr = sid != null ? 'data-tv-sid' : 'data-tv-id'
+        const val = sid != null ? sid : el.getAttribute('data-tv-id')
+        if (highlighted && highlighted.attr === attr && highlighted.val === val) return
+        clearHighlight()
+        applyHighlight(attr, val)
       })
       doc.addEventListener('mouseleave', () => {
-        setHighlight(highlightedId, false)
-        highlightedId = null
+        clearHighlight()
       })
     }
 
@@ -479,6 +813,10 @@
   // --- teardown（原状復帰）---
   window.__translateAddonTeardown = () => {
     document.removeEventListener('keydown', onKeydown, true)
+    if (sharedTranslator && typeof sharedTranslator.destroy === 'function') {
+      sharedTranslator.destroy()
+      sharedTranslator = null
+    }
     overlay.remove()
     document.documentElement.style.overflow = prevHtmlOverflow
     window.__translateAddonActive = false
