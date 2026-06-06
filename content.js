@@ -294,13 +294,21 @@
   }
 
   /**
-   * テキストノードが翻訳対象外か（script/style など除外タグの直下か）を判定する。
+   * テキストノードが翻訳対象外か（script/style/pre/code など除外タグの配下か）を判定する。
    * @param {Text} node 判定対象
    * @returns {boolean} 除外すべきなら true
    */
   function isSkippedText(node) {
-    const parent = node.parentElement
-    return !parent || SKIP_TAGS.has(parent.tagName)
+    // 祖先のいずれかが除外タグなら対象外。
+    // 直接の親だけ見ると、<pre><code><span>...</span></code></pre> のように間に <span> 等が
+    // 挟まったコードブロックを取りこぼし、翻訳対象にして中身を壊してしまうため祖先まで辿る。
+    let el = node.parentElement
+    if (!el) return true
+    while (el) {
+      if (SKIP_TAGS.has(el.tagName)) return true
+      el = el.parentElement
+    }
+    return false
   }
 
   /**
