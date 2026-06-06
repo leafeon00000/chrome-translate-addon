@@ -162,6 +162,18 @@
   }
 
   /**
+   * 記録したスクロール率の位置へ復元する（ratio が null のときは何もしない）。
+   * @param {Document} doc 対象ドキュメント
+   * @param {number|null} ratio スクロール率（scrollTop / 最大スクロール量）
+   * @returns {void}
+   */
+  function restoreScroll(doc, ratio) {
+    if (ratio == null) return
+    const se = doc.scrollingElement
+    if (se) se.scrollTop = ratio * (se.scrollHeight - se.clientHeight)
+  }
+
+  /**
    * 全画面オーバーレイ（ツールバー＋左右iframe）を構築して追加する。
    *
    * @param {string} snapshotHtml srcdoc に渡すHTML
@@ -1096,8 +1108,16 @@
         status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
         return
       }
+      // 再ロードで先頭に戻らないよう、読んでいた位置（左ペインのスクロール率）を保持する
+      let scrollRatio = null
       // 既に翻訳済み（span化済み）なら、スナップショットから作り直して粒度・言語変更や再翻訳に備える
       if (rightDoc.querySelector('[data-tv-sid]')) {
+        // 再ロード前に左ペインのスクロール率を記録（左は原文なので再ロード後も高さがほぼ一致する）
+        const se = leftDoc.scrollingElement
+        if (se) {
+          const max = se.scrollHeight - se.clientHeight
+          scrollRatio = max > 0 ? se.scrollTop / max : 0
+        }
         status.textContent = '再読み込み中…'
         progressFill.style.setProperty('width', '0%', 'important')
         const lp = waitSnapshotLoad(leftIframe)
@@ -1108,6 +1128,8 @@
         curLeftDoc = leftDoc
         curRightDoc = rightDoc
         setupSync(leftDoc, rightDoc)
+        // 翻訳完了を待たず、再ロード直後に読んでいた位置へ即復元する
+        restoreScroll(leftDoc, scrollRatio)
       }
       // 翻訳元の言語を決定（自動判別 or 手動選択。自動が不可なら英語フォールバック）
       const sourceLang = await resolveSourceLang(leftDoc)
