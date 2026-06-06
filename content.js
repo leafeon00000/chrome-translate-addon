@@ -625,7 +625,7 @@
    *
    * @param {string} text テキストノードの文字列
    * @param {number} offset カーソル直下の文字オフセット
-   * @returns {string|null} 切り出した単語（英字を含まなければ null）
+   * @returns {{ word: string, start: number, end: number }|null} 単語と範囲（英字を含まなければ null）
    */
   function extractWordAt(text, offset) {
     if (!text) return null
@@ -637,7 +637,8 @@
     while (start > 0 && isWordChar(text[start - 1])) start--
     while (end < text.length && isWordChar(text[end])) end++
     const word = text.slice(start, end).replace(/^[''-]+|[''-]+$/g, '')
-    return /[A-Za-z]/.test(word) ? word : null
+    if (!/[A-Za-z]/.test(word)) return null
+    return { word, start, end }
   }
 
   // 単語ホバー辞書セッション（Prompt API / Gemini Nano）。初回のみ生成して使い回す。
@@ -817,11 +818,23 @@
         hideTip()
         return
       }
-      const word = extractWordAt(range.startContainer.nodeValue, range.startOffset)
-      if (!word) {
+      const info = extractWordAt(range.startContainer.nodeValue, range.startOffset)
+      if (!info) {
         hideTip()
         return
       }
+      // caretRangeFromPoint は空白上でも近くの単語を返すため、カーソルが実際に
+      // 単語の矩形に乗っているか確認する（何もない所での誤表示を防ぐ）
+      const wr = leftDoc.createRange()
+      wr.setStart(range.startContainer, info.start)
+      wr.setEnd(range.startContainer, info.end)
+      const rect = wr.getBoundingClientRect()
+      const m = 2
+      if (x < rect.left - m || x > rect.right + m || y < rect.top - m || y > rect.bottom + m) {
+        hideTip()
+        return
+      }
+      const word = info.word
       if (word === currentWord) {
         // 同じ単語上の移動：位置だけ追従させる
         if (tip.classList.contains('tv-word-tip-show')) positionTip(x, y)
