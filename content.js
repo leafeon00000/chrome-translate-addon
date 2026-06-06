@@ -22,9 +22,22 @@
   }
   window.__translateAddonActive = true
 
-  // 翻訳元・翻訳先の言語（英→日 固定）
-  const SOURCE_LANG = 'en'
+  // 翻訳先は日本語固定。翻訳元は自動判別 or 手動選択（自動判別できない時のフォールバックは英語）
   const TARGET_LANG = 'ja'
+  const DEFAULT_SOURCE_LANG = 'en'
+  // 翻訳元の言語フィールドに出す選択肢（value=BCP-47基本コード, label=表示名）。先頭は自動判別。
+  const SOURCE_LANG_OPTIONS = [
+    ['auto', '自動判別'],
+    ['en', '英語'],
+    ['zh', '中国語'],
+    ['ko', '韓国語'],
+    ['fr', 'フランス語'],
+    ['de', 'ドイツ語'],
+    ['es', 'スペイン語'],
+    ['it', 'イタリア語'],
+    ['pt', 'ポルトガル語'],
+    ['ru', 'ロシア語'],
+  ]
   // 同一 translator インスタンスへ同時に投げる翻訳リクエスト数の上限
   const CONCURRENCY = 4
   // テキストノードを翻訳対象から除外する親タグ
@@ -152,9 +165,9 @@
    * 全画面オーバーレイ（ツールバー＋左右iframe）を構築して追加する。
    *
    * @param {string} snapshotHtml srcdoc に渡すHTML
-   * @returns {{ overlay: HTMLElement, granularity: HTMLSelectElement, translateBtn: HTMLButtonElement,
-   *            status: HTMLElement, progressFill: HTMLElement, leftIframe: HTMLIFrameElement,
-   *            rightIframe: HTMLIFrameElement }}
+   * @returns {{ overlay: HTMLElement, srcLang: HTMLSelectElement, granularity: HTMLSelectElement,
+   *            translateBtn: HTMLButtonElement, status: HTMLElement, progressFill: HTMLElement,
+   *            leftIframe: HTMLIFrameElement, rightIframe: HTMLIFrameElement }}
    */
   function buildOverlay(snapshotHtml) {
     const overlay = document.createElement('div')
@@ -166,7 +179,18 @@
 
     const title = document.createElement('span')
     title.className = 'tv-title'
-    title.textContent = '対訳ビューア（英→日）'
+    title.textContent = '対訳ビューア（→日）'
+
+    // 翻訳元の言語フィールド（先頭=自動判別。翻訳開始前に選択、実行中は無効化）
+    const srcLang = document.createElement('select')
+    srcLang.className = 'tv-srclang'
+    srcLang.title = '翻訳元の言語（自動判別 / 手動選択）'
+    for (const [value, label] of SOURCE_LANG_OPTIONS) {
+      const opt = document.createElement('option')
+      opt.value = value
+      opt.textContent = label
+      srcLang.appendChild(opt)
+    }
 
     // 翻訳粒度の切替（翻訳開始前に選択。実行中は無効化する）
     const granularity = document.createElement('select')
@@ -199,7 +223,7 @@
     closeBtn.textContent = '閉じる ✕'
     closeBtn.addEventListener('click', () => window.__translateAddonTeardown())
 
-    toolbar.append(title, granularity, translateBtn, status, progress, closeBtn)
+    toolbar.append(title, srcLang, granularity, translateBtn, status, progress, closeBtn)
 
     // --- 左右iframe ---
     const columns = document.createElement('div')
@@ -225,6 +249,7 @@
 
     return {
       overlay,
+      srcLang,
       granularity,
       translateBtn,
       status,
@@ -309,11 +334,12 @@
    * モデル未取得時はダウンロード進捗を status / progressFill に反映する。
    * 生成した translator は破棄せず返す（文翻訳と単語ホバー辞書で流用し、teardown で破棄）。
    *
+   * @param {string} sourceLang 翻訳元の言語コード
    * @param {HTMLElement} status 状態表示用の要素
    * @param {HTMLElement} progressFill 進捗バーの伸縮要素
    * @returns {Promise<Translator|null>} 生成した translator（利用不可・失敗時は null）
    */
-  async function prepareTranslator(status, progressFill) {
+  async function prepareTranslator(sourceLang, status, progressFill) {
     if (typeof Translator === 'undefined') {
       status.textContent = 'このブラウザは内蔵翻訳に未対応です（Chrome 138以降のデスクトップ版が必要）'
       return null
@@ -323,7 +349,7 @@
     let availability
     try {
       availability = await Translator.availability({
-        sourceLanguage: SOURCE_LANG,
+        sourceLanguage: sourceLang,
         targetLanguage: TARGET_LANG,
       })
     } catch (err) {
@@ -332,7 +358,7 @@
       return null
     }
     if (availability === 'unavailable') {
-      status.textContent = '英→日の翻訳モデルが利用できません（環境を確認してください）'
+      status.textContent = `「${sourceLang}→日本語」の翻訳モデルが利用できません（言語を選び直してください）`
       return null
     }
 
@@ -340,7 +366,7 @@
       status.textContent =
         availability === 'available' ? '翻訳エンジンを準備中…' : '翻訳モデルをダウンロード中…'
       return await Translator.create({
-        sourceLanguage: SOURCE_LANG,
+        sourceLanguage: sourceLang,
         targetLanguage: TARGET_LANG,
         monitor(m) {
           m.addEventListener('downloadprogress', (e) => {
@@ -354,6 +380,58 @@
       status.textContent = '翻訳エンジンの初期化に失敗しました'
       console.error(err)
       return null
+    }
+  }
+
+  /**
+   * 言語判定用に、ドキュメント本文の先頭サンプルテキストを取り出す。
+   * @param {Document} doc 対象ドキュメント（左ペイン＝原文）
+   * @returns {string} 空白を正規化した先頭1000文字
+   */
+  function sampleText(doc) {
+    const t = (doc.body && doc.body.innerText) || ''
+    return t.replace(/\s+/g, ' ').trim().slice(0, 1000)
+  }
+
+  /**
+   * Chrome 内蔵の Language Detector API で原文の言語を判定する。
+   * 「翻訳開始を押した瞬間」に判定できるよう、モデルDL済み（available）のときだけ使う。
+   * 未DL・未対応・低確信・失敗時は null を返し、呼び出し側が手動選択/英語にフォールバックする。
+   *
+   * @param {string} sample 判定対象のサンプルテキスト
+   * @returns {Promise<string|null>} 言語コード（基本サブタグ）または null
+   */
+  async function detectLanguage(sample) {
+    if (typeof LanguageDetector === 'undefined' || !sample) return null
+    try {
+      const avail = await LanguageDetector.availability()
+      if (avail !== 'available') return null
+      const detector = await LanguageDetector.create()
+      const results = await detector.detect(sample)
+      if (typeof detector.destroy === 'function') detector.destroy()
+      const top = results && results[0]
+      if (!top || (top.confidence != null && top.confidence < 0.5)) return null
+      // 'zh-Hant' 等は基本コードに丸める
+      return String(top.detectedLanguage || '').split('-')[0] || null
+    } catch (err) {
+      console.error('言語判定に失敗:', err)
+      return null
+    }
+  }
+
+  /**
+   * 言語コードを日本語の表示名に変換する。
+   * 選択肢リストにあればその表示名、無ければ Intl.DisplayNames、それも無理ならコードをそのまま返す。
+   * @param {string} code 言語コード（基本サブタグ）
+   * @returns {string} 表示名
+   */
+  function langLabel(code) {
+    const found = SOURCE_LANG_OPTIONS.find(([v]) => v === code)
+    if (found) return found[1]
+    try {
+      return new Intl.DisplayNames(['ja'], { type: 'language' }).of(code) || code
+    } catch {
+      return code
     }
   }
 
@@ -574,15 +652,16 @@
   }
 
   /**
-   * 左iframe（英語原文）で単語にマウスオーバーすると、訳と辞書をツールチップ表示する機能を有効化する。
-   * まず Translator の機械翻訳を即表示し、Prompt API（Gemini Nano）の辞書（品詞＋意味複数）が
-   * 返ったら追記する2段階表示。Prompt API が使えない環境では機械翻訳のみ表示する。
+   * 左iframe（原文）で単語にマウスオーバーすると、訳と辞書をツールチップ表示する機能を有効化する。
+   * まず Translator の機械翻訳を即表示し、原文が英語かつ Prompt API（Gemini Nano）が使える環境では
+   * 辞書（品詞＋意味複数）を返り次第追記する2段階表示。英語以外・Prompt API 不可なら機械翻訳のみ。
    *
    * @param {Document} leftDoc 左iframeのドキュメント
    * @param {Translator} translator 流用する翻訳インスタンス
+   * @param {string} sourceLang 翻訳元の言語（辞書は 'en' のときのみ有効）
    * @returns {void}
    */
-  function enableWordHover(leftDoc, translator) {
+  function enableWordHover(leftDoc, translator, sourceLang) {
     // 二重有効化を防ぐ（同一 leftDoc に複数回張らない）
     if (leftDoc.__tvWordHover) return
     leftDoc.__tvWordHover = true
@@ -599,11 +678,13 @@
     // 機械翻訳・辞書を別々にキャッシュ（再ホバーを即時化）
     const mtCache = new Map()
     const dictCache = new Map()
-    // Prompt API セッション（準備でき次第セットされる。null の間は機械翻訳のみ表示）
+    // Prompt API セッション（原文が英語のときだけ準備。null の間は機械翻訳のみ表示）
     let lmSession = null
-    getDictSession().then((s) => {
-      lmSession = s
-    })
+    if (sourceLang === 'en') {
+      getDictSession().then((s) => {
+        lmSession = s
+      })
+    }
 
     // 現在カーソル下にある単語。非同期解決時に最新語と一致する時だけ反映する
     let currentWord = null
@@ -789,11 +870,39 @@
   const prevHtmlOverflow = document.documentElement.style.overflow
   document.documentElement.style.overflow = 'hidden'
 
-  const { overlay, granularity, translateBtn, status, progressFill, leftIframe, rightIframe, leftLoaded, rightLoaded } =
+  const { overlay, srcLang, granularity, translateBtn, status, progressFill, leftIframe, rightIframe, leftLoaded, rightLoaded } =
     buildOverlay(snapshotHtml)
 
-  // 単語ホバー辞書で流用し、teardown で破棄するための translator 参照
+  // 単語ホバー辞書で流用し、teardown で破棄するための translator 参照（言語が変わったら作り直す）
   let sharedTranslator = null
+  let sharedTranslatorLang = null
+
+  /**
+   * 「自動判別」選択肢のラベルに判定結果を反映する（例: 自動判別（英語））。
+   * code が null（判定不可）のときはフォールバック（英語）である旨を表示する。
+   * @param {string|null} code 判定された言語コード、または null
+   * @returns {void}
+   */
+  function updateAutoLabel(code) {
+    const opt = srcLang.querySelector('option[value="auto"]')
+    if (!opt) return
+    opt.textContent = code ? `自動判別（${langLabel(code)}）` : '自動判別（判定不可→英語）'
+  }
+
+  /**
+   * 翻訳元の言語を決定する。フィールドが「自動判別」のときは Language Detector で判定し、
+   * 判定結果を言語フィールドのラベルに表示する。「押した瞬間」に判定できない（未DL等）場合は
+   * 英語にフォールバックする。
+   * @param {Document} leftDoc 原文側ドキュメント（判定のサンプル取得元）
+   * @returns {Promise<string>} 翻訳元の言語コード
+   */
+  async function resolveSourceLang(leftDoc) {
+    const sel = srcLang.value
+    if (sel !== 'auto') return sel
+    const detected = await detectLanguage(sampleText(leftDoc))
+    updateAutoLabel(detected)
+    return detected || DEFAULT_SOURCE_LANG
+  }
 
   // 現在表示中のドキュメント（再翻訳の再ロードで差し替わる）
   let curLeftDoc = null
@@ -979,19 +1088,15 @@
     const mode = granularity.value
     translateBtn.disabled = true
     granularity.disabled = true
+    srcLang.disabled = true
     try {
-      // translator は初回のみ生成（モデルDLにはユーザー操作が要る）。以降は再利用する。
-      if (!sharedTranslator) {
-        sharedTranslator = await prepareTranslator(status, progressFill)
-        if (!sharedTranslator) return
-      }
       let leftDoc = curLeftDoc
       let rightDoc = curRightDoc
       if (!leftDoc || !rightDoc) {
         status.textContent = 'このページは描画できませんでした（CSP制限の可能性）'
         return
       }
-      // 既に翻訳済み（span化済み）なら、スナップショットから作り直して粒度変更・再翻訳に備える
+      // 既に翻訳済み（span化済み）なら、スナップショットから作り直して粒度・言語変更や再翻訳に備える
       if (rightDoc.querySelector('[data-tv-sid]')) {
         status.textContent = '再読み込み中…'
         progressFill.style.setProperty('width', '0%', 'important')
@@ -1004,16 +1109,30 @@
         curRightDoc = rightDoc
         setupSync(leftDoc, rightDoc)
       }
+      // 翻訳元の言語を決定（自動判別 or 手動選択。自動が不可なら英語フォールバック）
+      const sourceLang = await resolveSourceLang(leftDoc)
+      if (sourceLang === TARGET_LANG) {
+        status.textContent = 'このページは日本語と判定されました（翻訳元の言語を選び直してください）'
+        return
+      }
+      // 言語が変わったら translator を作り直す（初回 or 言語切替時のみ生成）
+      if (!sharedTranslator || sharedTranslatorLang !== sourceLang) {
+        if (sharedTranslator && typeof sharedTranslator.destroy === 'function') sharedTranslator.destroy()
+        sharedTranslator = await prepareTranslator(sourceLang, status, progressFill)
+        sharedTranslatorLang = sourceLang
+        if (!sharedTranslator) return
+      }
       // 左右を選択粒度の <span data-tv-sid> にラップ（同一スナップショット＋同一分割で sid 一致）
       wrapSentences(leftDoc, mode)
       wrapSentences(rightDoc, mode)
-      // 右ペインを翻訳し、左ペインに単語ホバー辞書を有効化する
+      // 右ペインを翻訳し、左ペインに単語ホバー辞書を有効化する（辞書は英語原文時のみ）
       await translateSentences(rightDoc, sharedTranslator, status, progressFill, mode)
-      enableWordHover(leftDoc, sharedTranslator)
+      enableWordHover(leftDoc, sharedTranslator, sourceLang)
     } finally {
-      // 粒度を変えて再翻訳できるよう操作を再有効化する
+      // 粒度・言語を変えて再翻訳できるよう操作を再有効化する
       translateBtn.disabled = false
       granularity.disabled = false
+      srcLang.disabled = false
     }
   }
   translateBtn.addEventListener('click', runTranslate)
@@ -1029,10 +1148,18 @@
       status.textContent = 'このブラウザは内蔵翻訳に未対応です（Chrome 138以降のデスクトップ版が必要）'
       return
     }
+    const leftDoc = curLeftDoc
+    if (!leftDoc) return
+    // 翻訳元の言語を決定（自動判別は「押した瞬間」に判定できる場合のみ。不可なら英語フォールバック）
+    const sourceLang = await resolveSourceLang(leftDoc)
+    if (sourceLang === TARGET_LANG) {
+      status.textContent = 'このページは日本語と判定されました（翻訳元の言語を選び直してください）'
+      return
+    }
     let availability
     try {
       availability = await Translator.availability({
-        sourceLanguage: SOURCE_LANG,
+        sourceLanguage: sourceLang,
         targetLanguage: TARGET_LANG,
       })
     } catch (err) {
@@ -1044,7 +1171,7 @@
       // モデルDL不要のため、ユーザー操作なしでそのまま翻訳できる
       runTranslate()
     } else if (availability === 'unavailable') {
-      status.textContent = '英→日の翻訳モデルが利用できません（環境を確認してください）'
+      status.textContent = `「${sourceLang}→日本語」の翻訳モデルが利用できません（言語を選び直してください）`
     } else {
       // downloadable / downloading：初回DLにはユーザー操作が要るためボタンを促す
       status.textContent = '「翻訳開始」を押すと翻訳モデルをダウンロードして翻訳します'
